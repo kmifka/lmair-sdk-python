@@ -2,12 +2,11 @@ from __future__ import annotations
 
 import re
 import socket
-import threading
-from urllib.parse import urlparse
 import xml.etree.ElementTree as ET
 from threading import Thread, Event
 from time import sleep
 from typing import List, Optional, Callable
+from urllib.parse import urlparse
 
 import requests
 from requests import Response
@@ -15,17 +14,17 @@ from requests import Response
 
 class _LMConnector:
     """Handles the TCP connection to the light manager"""
-    CONNECT_CMD = "/control?pcip="
+    POLL_PATH = "/poll.htm"
     RECEIVE_IDENTIFIER = "rfit,"
     DISCOVER_MESSAGE = "D"
 
-    def __init__(self, url: str, username: str, password: str, refresh_interval: int = None,
+    def __init__(self, url: str, username: str, password: str, poll_interval: int = None,
                  adapter_ip: str = None, receive_port: int = None):
         """
         :param url: url for connecting to light manager. E.g. http://lmair
         :param username: lan username
         :param password: lan password
-        :param refresh_interval: interval of tcp connection refresh in seconds
+        :param poll_interval: interval of polling data
         :param adapter_ip: Ip of the desired network adapter
         :param receive_port: port of the tcp connection
         """
@@ -33,12 +32,12 @@ class _LMConnector:
         self._adapter_ip: str = adapter_ip or self._get_default_adapter_ip()
         self._username: str = username
         self._password: str = password
-        self._refresh_interval: int = refresh_interval or 20
+        self._refresh_interval: int = poll_interval or 0.1
         self._receive_port: int = receive_port or 30304
         self._stop: Event = Event()
         self._socket: Optional[socket] = None
         self._thread: Optional[Thread] = None
-        self._refresh_thread: Optional[Thread] = None
+        self._polling_thread: Optional[Thread] = None
 
     @staticmethod
     def discover(discover_target_ip=None, wait_duration: int = None, discover_adapter_ip: str = None,
@@ -90,61 +89,37 @@ class _LMConnector:
             if sock:
                 sock.close()
 
-    def connect(self, callback: Callable[[str], None]) -> None:
+    def start_polling(self, callback: Callable[[str], None]) -> None:
         """Connects to the TCP stream
 
         :param callback: Callback that is called when data has been received
         """
-        if self._thread and self._refresh_thread:
+        if self._polling_thread:
             return
 
         self._stop.clear()
 
-        def _refresh_connection():
+        def _poll():
             while not self._stop.is_set():
-                self._send_connect(self._adapter_ip)
+                message = self.send(self.POLL_PATH).content.decode()
+                results = message.split("\r")[:-1]
+                for result in results:
+                    if self.RECEIVE_IDENTIFIER in result:
+                        data = result.split(self.RECEIVE_IDENTIFIER)
+                        callback(data[1])
                 sleep(self._refresh_interval)
 
-        def _receive():
-            while not self._stop.is_set():
-                new_sock = None
-                try:
-                    new_sock, address = self._socket.accept()
-                    data = new_sock.recv(1024).replace(b"\x00", b"").decode()
+        self._polling_thread = Thread(target=_poll)
+        self._polling_thread.start()
 
-                    if data.startswith(self.RECEIVE_IDENTIFIER):
-                        callback(data.replace(self.RECEIVE_IDENTIFIER, "", 1))
-                    else:
-                        self._send_connect(self._adapter_ip)
-                finally:
-                    if new_sock:
-                        new_sock.close()
-
-        self._socket: socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self._socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self._socket.bind((self._adapter_ip, self._receive_port))
-        self._socket.listen(5)
-
-        self._thread = Thread(target=_receive)
-        self._refresh_thread = Thread(target=_refresh_connection)
-        self._thread.start()
-        self._refresh_thread.start()
-
-    def disconnect(self) -> None:
+    def stop_polling(self) -> None:
         """Connects from the TCP stream"""
-        if not self._thread and not self._refresh_thread:
+        if not self._polling_thread:
             return
 
         self._stop.set()
-        self._send_connect("")
-
-        if self._thread is not threading.current_thread():
-            self._thread.join(0)
-        self._refresh_thread.join(0)
-        self._socket.close()
-        self._socket = None
-        self._thread = None
-        self._refresh_thread = None
+        self._polling_thread.join(0)
+        self._polling_thread = None
 
     def send(self, path: str, cmd: str = None, value: str = None, check_response: bool = True) -> Response:
         """Sends a command to the light manager
@@ -171,13 +146,6 @@ class _LMConnector:
             raise AssertionError(f"Request was not successful! ({response.content.decode()})")
 
         return response
-
-    def _send_connect(self, ip: str) -> None:
-        """Sends connect message to the light manager
-
-        :param ip: IP address of host system
-        """
-        self.send("/control", "pcip", ip)
 
     @staticmethod
     def _get_default_adapter_ip():
@@ -407,11 +375,11 @@ class LMAir(_LMFixture):
 
         :param callback: Callback function which is called whenever a code is received.
         """
-        self._connector.connect(callback)
+        self._connector.start_polling(callback)
 
     def stop_radio_bus_listening(self) -> None:
         """Stop listening for radio bus actuators"""
-        self._connector.disconnect()
+        self._connector.stop_polling()
 
     def _load_config(self) -> ET.Element:
         """Loads the config xml from light manager"""
