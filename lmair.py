@@ -101,7 +101,7 @@ class _LMConnector:
 
         def _poll():
             while not self._stop.is_set():
-                message = self.send(self.POLL_PATH).content.decode()
+                message = self.send(self.POLL_PATH, check_response=False).content.decode()
                 results = message.split("\r")[:-1]
                 for result in results:
                     if self.RECEIVE_IDENTIFIER in result:
